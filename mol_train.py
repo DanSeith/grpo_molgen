@@ -14,12 +14,18 @@ from torch.nn.utils import clip_grad_norm_
 
 import wandb
 
+from tqdm import tqdm
+from rdkit import RDLogger
 
 from models import MolecularLSTM, MolecularGRU, TinyMolecularTransformer
 from data import SMILESTokenizer, create_molecular_dataloader, load_chembl_subset
 from rewards import CompositeReward, QEDReward, ValidityReward
 from loss import GRPOLoss
 from replay_buffer import ReplayBuffer, Experience, join_experience_batch
+
+
+# Disable RDKit logging
+RDLogger.DisableLog('rdApp.*')
 
 
 def set_seed(seed: int):
@@ -386,7 +392,7 @@ def main():
     
     # GRPO training phase
     print("Starting GRPO training phase...")
-    for epoch in range(args.num_epochs):
+    for epoch in tqdm(range(args.num_epochs), desc="GRPO epochs"):
         # Clear replay buffer at the start of each epoch
         replay_buffer.clear()
         
@@ -395,7 +401,8 @@ def main():
         total_reward = 0.0
         total_rollouts = 0
         
-        for batch in train_loader:
+        rollout_bar = tqdm(train_loader, desc=f"Rollouts for epoch {epoch+1}/{args.num_epochs}", leave=False)
+        for batch in rollout_bar:
             input_ids, attention_mask = prepare_batch_for_model(
                 args.model_type, batch, device
             )
@@ -437,6 +444,9 @@ def main():
             total_reward += returns.sum().item()
             total_rollouts += sequence_ids.shape[0]
             
+            current_avg_reward = total_reward / total_rollouts if total_rollouts > 0 else 0
+            rollout_bar.set_postfix(avg_reward=f"{current_avg_reward:.4f}")
+            
             # Print sample generations at each epoch
             if len(replay_buffer) > 0 and total_rollouts <= args.rollouts_per_batch:
                 for i in range(min(3, sequence_ids.shape[0])):
@@ -445,7 +455,8 @@ def main():
                     print(f"Generated: {smiles}, Reward: {reward:.4f}")
         
         # 2. Train policy with GRPO for multiple epochs
-        for _ in range(args.grpo_epochs):
+        policy_bar = tqdm(range(args.grpo_epochs), desc="GRPO policy update", leave=False)
+        for _ in policy_bar:
             model.train()
             
             # Process all experiences in the replay buffer
@@ -466,6 +477,7 @@ def main():
             loss.backward()
             clip_grad_norm_(model.parameters(), args.max_norm)
             optimizer.step()
+            policy_bar.set_postfix(loss=f"{loss.item():.4f}", kl=f"{kl.item():.4f}")
         
         # 3. Update reference model at the end of each epoch
         reference_model.load_state_dict(model.state_dict())
